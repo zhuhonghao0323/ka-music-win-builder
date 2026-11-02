@@ -115,9 +115,32 @@ jobs:
         working-directory: src
         run: flutter pub get
 
+      - name: Patch CMake for new MSVC
+        if: steps.gate.outputs.skip != 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # 在 project() 之后注入编译定义，可传播到后续 add_subdirectory 的插件子项目
+          $f = "windows/CMakeLists.txt"
+          $c = Get-Content $f -Raw
+          if ($c -notmatch "_SILENCE_EXPERIMENTAL_COROUTINE") {
+            $c = $c -replace '(?m)^(project\(kgka_music_hl LANGUAGES CXX\))', "`$1`n`nadd_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)"
+            Set-Content -Path $f -Value $c -NoNewline -Encoding UTF8
+            Write-Host "已注入编译定义"
+          } else {
+            Write-Host "编译定义已存在"
+          }
+          Select-String -Path $f -Pattern "_SILENCE_EXPERIMENTAL_COROUTINE" | ForEach-Object { Write-Host $_.Line }
+
       - name: Build Windows release
         if: steps.gate.outputs.skip != 'true'
         working-directory: src
+        # 新版 MSVC（VS 18 / 14.5x）已移除 <experimental/coroutine> 与 /await，
+        # 而 just_audio_windows、permission_handler_windows 等插件仍在用，
+        # 这里打开微软提供的临时兼容开关。
+        env:
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+          _CL_: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows --release
 
       - name: Package portable zip and installer
