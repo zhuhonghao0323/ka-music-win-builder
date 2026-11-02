@@ -59,6 +59,9 @@ jobs:
           ref: ${{ steps.up.outputs.ref }}
           path: src
           fetch-depth: 1
+          # 上游 .gitattributes 把 *.ico / *.png 交给 Git LFS 管理，
+          # 不拉 LFS 会拿到指针文本，导致 RC2175 图标格式错误
+          lfs: true
 
       - name: Read app version
         id: meta
@@ -131,6 +134,32 @@ jobs:
             Write-Host "编译定义已存在"
           }
           Select-String -Path $f -Pattern "_SILENCE_EXPERIMENTAL_COROUTINE" | ForEach-Object { Write-Host $_.Line }
+
+      - name: Verify app icon
+        if: steps.gate.outputs.skip != 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # 校验 windows/runner/resources/app_icon.ico 是不是真正的 ICO（LFS 指针会导致 RC2175）
+          $ico = "windows/runner/resources/app_icon.ico"
+          $ok = $false
+          if (Test-Path $ico) {
+            $b = [System.IO.File]::ReadAllBytes($ico)
+            if ($b.Length -gt 64 -and $b[0] -eq 0 -and $b[1] -eq 0 -and $b[2] -eq 1 -and $b[3] -eq 0) { $ok = $true }
+            Write-Host "app_icon.ico 大小: $($b.Length) 字节, 有效: $ok"
+          } else {
+            Write-Host "app_icon.ico 不存在"
+          }
+          if (-not $ok) {
+            $fallback = Join-Path $env:GITHUB_WORKSPACE "app.ico"
+            if (Test-Path $fallback) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $ico) | Out-Null
+              Copy-Item $fallback $ico -Force
+              Write-Host "已用备用图标替换"
+            } else {
+              throw "图标无效且没有备用图标"
+            }
+          }
 
       - name: Build Windows release
         if: steps.gate.outputs.skip != 'true'
