@@ -204,6 +204,16 @@ jobs:
           } else {
             $iconLine = ""
           }
+          # Inno Setup 官方安装包不含简体中文，这里用仓库自带的中文语言文件
+          $islSrc = Join-Path (Get-Location) "ChineseSimplified.isl"
+          $hasZh = Test-Path $islSrc
+          if ($hasZh) {
+            Copy-Item $islSrc "dist/ChineseSimplified.isl" -Force
+          }
+          $langLines = @("[Languages]")
+          if ($hasZh) { $langLines += 'Name: "chs"; MessagesFile: "ChineseSimplified.isl"' }
+          $langLines += 'Name: "en"; MessagesFile: "compiler:Default.isl"'
+          $langSection = $langLines -join "`r`n"
           $iss = @"
           [Setup]
           AppId={{8E4C1B2A-7F3D-4A6E-9C5B-1D2E3F4A5B6C}
@@ -232,9 +242,7 @@ jobs:
           CloseApplications=yes
           RestartApplications=no
 
-          [Languages]
-          Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-          Name: "en"; MessagesFile: "compiler:Default.isl"
+          $langSection
 
           [Tasks]
           Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -250,14 +258,23 @@ jobs:
           [Run]
           Filename: "{app}\kgka_music_hl.exe"; Description: "{cm:LaunchProgram,KA Music}"; Flags: nowait postinstall skipifsilent
           "@
-          Set-Content -Path $issPath -Value $iss -Encoding UTF8
+          Set-Content -Path $issPath -Value $iss -Encoding utf8BOM
 
           $iscc = @(
             "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
             "C:\Program Files\Inno Setup 6\ISCC.exe"
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { throw "未找到 Inno Setup 编译器" }
+          Write-Host "ISCC: $iscc ($((Get-Item $iscc).VersionInfo.FileVersion))"
+
           & $iscc $issPath
+          if ($LASTEXITCODE -ne 0 -and $hasZh) {
+            # 中文语言文件与 runner 上的 Inno Setup 版本不匹配时，回退英文界面
+            Write-Host "中文语言文件不兼容，回退英文界面重试"
+            $issEn = $iss -replace '(?m)^\s*Name: "chs";.*$', ''
+            Set-Content -Path $issPath -Value $issEn -Encoding utf8BOM
+            & $iscc $issPath
+          }
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
 
           Get-ChildItem dist | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize | Out-String | Write-Host
