@@ -1,0 +1,270 @@
+name: Build KA Music for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 ref（tag / 分支 / commit），留空则用 master"
+        required: false
+        default: ""
+      force:
+        description: "强制重新构建并覆盖同名 Release"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # 每天 UTC 19:00 = 北京时间 03:00，自动检查上游是否有更新
+    - cron: "0 19 * * *"
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: umr-xiaomai/kgka_Music_hl
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Resolve upstream ref
+        id: up
+        shell: bash
+        run: |
+          set -e
+          REF="${{ github.event.inputs.upstream_ref }}"
+          if [ -z "$REF" ]; then REF="master"; fi
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM}.git" "$REF" | head -1 | cut -f1)
+          if [ -z "$SHA" ]; then
+            # ref 可能是 tag，直接解析
+            SHA=$(git ls-remote "https://github.com/${UPSTREAM}.git" "refs/tags/$REF^{}" | head -1 | cut -f1)
+          fi
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote "https://github.com/${UPSTREAM}.git" "refs/tags/$REF" | head -1 | cut -f1)
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Resolved $REF -> $SHA"
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.up.outputs.ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Read app version
+        id: meta
+        shell: bash
+        working-directory: src
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed 's/version:[[:space:]]*//' | tr -d '\r' | cut -d'+' -f1)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=win-v$V" >> "$GITHUB_OUTPUT"
+          echo "App version: $V"
+
+      - name: Check if release already exists
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.meta.outputs.tag }}"
+          SHA="${{ steps.up.outputs.sha }}"
+          FORCE="${{ github.event.inputs.force }}"
+          EXISTS=$(gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body 2>/dev/null || echo "")
+          if [ "$FORCE" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "强制构建"
+          elif [ -n "$EXISTS" ] && echo "$EXISTS" | grep -q "$SHA"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG 已包含 commit $SHA，跳过构建"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "需要构建"
+          fi
+
+      - name: Setup Flutter
+        if: steps.gate.outputs.skip != 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show toolchain
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          flutter --version
+          dart --version
+
+      - name: Enable Windows desktop
+        if: steps.gate.outputs.skip != 'true'
+        run: flutter config --enable-windows-desktop
+
+      - name: Install dependencies
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: src
+        run: flutter pub get
+
+      - name: Build Windows release
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: src
+        run: flutter build windows --release
+
+      - name: Package portable zip and installer
+        if: steps.gate.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ steps.meta.outputs.version }}"
+          $candidates = @(
+            "src/build/windows/x64/runner/Release",
+            "src/build/windows/runner/Release"
+          )
+          $appDir = $candidates | Where-Object { Test-Path (Join-Path $_ "kgka_music_hl.exe") } | Select-Object -First 1
+          if (-not $appDir) { throw "找不到构建产物 kgka_music_hl.exe" }
+          $appDir = (Resolve-Path $appDir).Path
+          Write-Host "App dir: $appDir"
+          Get-ChildItem $appDir | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # ---- 免安装版 zip ----
+          $zip = "dist/KA-Music-$ver-portable-win64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $appDir "*") -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "Portable zip: $((Get-Item $zip).Length / 1MB) MB"
+
+          # ---- Inno Setup 安装包 ----
+          $issPath = Join-Path (Get-Location) "dist/setup.iss"
+          $icoPath = Join-Path (Get-Location) "app.ico"
+          if (Test-Path $icoPath) {
+            $iconLine = "SetupIconFile=$icoPath"
+          } else {
+            $iconLine = ""
+          }
+          $iss = @"
+          [Setup]
+          AppId={{8E4C1B2A-7F3D-4A6E-9C5B-1D2E3F4A5B6C}
+          AppName=KA Music
+          AppVersion=$ver
+          AppVerName=KA Music $ver
+          AppPublisher=umr-xiaomai
+          AppPublisherURL=https://github.com/umr-xiaomai/kgka_Music_hl
+          AppSupportURL=https://github.com/umr-xiaomai/kgka_Music_hl/issues
+          DefaultDirName={autopf}\KA Music
+          DefaultGroupName=KA Music
+          DisableProgramGroupPage=yes
+          OutputDir=$(Join-Path (Get-Location) "dist")
+          OutputBaseFilename=KA-Music-Setup-$ver-win64
+          $iconLine
+          UninstallDisplayIcon={app}\kgka_music_hl.exe
+          UninstallDisplayName=KA Music
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=lowest
+          PrivilegesRequiredOverridesAllowed=dialog
+          AllowNoIcons=yes
+          CloseApplications=yes
+          RestartApplications=no
+
+          [Languages]
+          Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+          Name: "en"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+          [Files]
+          Source: "$appDir\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{group}\KA Music"; Filename: "{app}\kgka_music_hl.exe"
+          Name: "{group}\{cm:UninstallProgram,KA Music}"; Filename: "{uninstallexe}"
+          Name: "{autodesktop}\KA Music"; Filename: "{app}\kgka_music_hl.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\kgka_music_hl.exe"; Description: "{cm:LaunchProgram,KA Music}"; Flags: nowait postinstall skipifsilent
+          "@
+          Set-Content -Path $issPath -Value $iss -Encoding UTF8
+
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "未找到 Inno Setup 编译器" }
+          & $iscc $issPath
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
+
+          Get-ChildItem dist | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload artifacts
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: KA-Music-Windows-${{ steps.meta.outputs.version }}
+          path: |
+            dist/KA-Music-Setup-*.exe
+            dist/KA-Music-*-portable-win64.zip
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish release
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.meta.outputs.tag }}"
+          VER="${{ steps.meta.outputs.version }}"
+          SHA="${{ steps.up.outputs.sha }}"
+          REF="${{ steps.up.outputs.ref }}"
+
+          cat > notes.md <<EOF
+          # KA Music $VER — Windows 版
+
+          由 GitHub Actions 自动构建，源码来自 [\`umr-xiaomai/kgka_Music_hl\`](https://github.com/umr-xiaomai/kgka_Music_hl)。
+
+          - 上游 ref：\`$REF\`
+          - 上游 commit：\`$SHA\`
+          - 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')
+          - 平台：Windows x64
+
+          ## 下载说明
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | \`KA-Music-Setup-$VER-win64.exe\` | 安装版，带开始菜单/桌面快捷方式和卸载程序 |
+          | \`KA-Music-$VER-portable-win64.zip\` | 免安装版，解压后双击 \`kgka_music_hl.exe\` 直接运行 |
+
+          > 安装包未做代码签名，Windows SmartScreen 可能提示"未知发布者"，点击"更多信息 → 仍要运行"即可。
+          EOF
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "更新已有 Release $TAG"
+            gh release upload "$TAG" dist/KA-Music-Setup-*.exe dist/KA-Music-*-portable-win64.zip \
+              --repo "${{ github.repository }}" --clobber
+            gh release edit "$TAG" --repo "${{ github.repository }}" --notes-file notes.md
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" \
+              dist/KA-Music-Setup-*.exe \
+              dist/KA-Music-*-portable-win64.zip \
+              --repo "${{ github.repository }}" \
+              --title "KA Music $VER (Windows)" \
+              --notes-file notes.md \
+              --latest
+          fi
